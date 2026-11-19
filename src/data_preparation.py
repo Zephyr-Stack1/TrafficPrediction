@@ -5,6 +5,7 @@ import numpy as np
 MINUTES_PER_DAY = 24 * 60
 DAY_PER_WEEK = 7
 DIMENSION_NUM_3 = 3
+MAX_SPEED_CHECK = 120
 
 logger = get_logger(__name__)
 
@@ -70,27 +71,58 @@ class TrafficNpzLoader:
 
         return data
 
+
 class TrafficCleaner:
 
-    def clean(self, data: TrafficData) -> TrafficData:
+    def __init__(self, maxSpeed = None):
+        if maxSpeed is not None:
+            if not isinstance(maxSpeed, (int, float)) or isinstance(maxSpeed, bool):
+                raise ValueError('maxSpeed must be a positive finite number')
+            if not np.isfinite(maxSpeed) or maxSpeed <= 0:
+                raise ValueError('maxSpeed must be a positive finite number')
+        self.maxSpeed = maxSpeed
+
+    def validate(self, data: TrafficData) -> None:
 
         x = data.x
         y = data.y
 
+        if not isinstance(x, np.ndarray):
+            raise ValueError('x must be a NumPy array')
         if x.ndim != DIMENSION_NUM_3 or min(x.shape) <= 0:
             raise ValueError('x must have shape [samples, history, sensors]')
+        if x.dtype.kind not in 'fiu':
+            raise ValueError('x must contain real numeric values')
 
         sampleCount = x.shape[0]
         sensorCount = x.shape[2]
 
+        if not isinstance(data.validMask, np.ndarray):
+            raise ValueError('validMask must be a NumPy array')
         if data.validMask.shape != (sampleCount, sensorCount):
             raise ValueError('validMask must have shape [samples, sensors]')
         if data.validMask.dtype != np.bool_:
             raise ValueError('validMask must contain boolean values')
+        if not isinstance(data.sensorIds, np.ndarray):
+            raise ValueError('sensorIds must be a NumPy array')
         if data.sensorIds.shape != (sensorCount,):
             raise ValueError('sensorIds has the wrong shape')
+        # Unicode string integer unsigned interger
+        if data.sensorIds.dtype.kind not in 'USiu':
+            raise ValueError('Sensor IDs must be strings or integers')
+        if np.any(np.char.strip(data.sensorIds.astype(str)) == ''):
+            raise ValueError('Sensor IDs must not be empty')
+        if not isinstance(data.sampleId, np.ndarray):
+            raise ValueError('sampleId must be a NumPy array')
         if data.sampleId.shape != (sampleCount,):
             raise ValueError('sampleId has the wrong shape')
+		# Unicode string integer unsigned interger
+        if data.sampleId.dtype.kind not in 'USiu':
+            raise ValueError('Sample IDs must be strings or integers')
+        if np.any(np.char.strip(data.sampleId.astype(str)) == ''):
+            raise ValueError('Sample IDs must not be empty')
+        if not isinstance(data.timestamps, np.ndarray):
+            raise ValueError('timestamps must be a NumPy array')
         if data.timestamps.shape != (sampleCount,):
             raise ValueError('timestamps has the wrong shape')
         if data.timestamps.dtype.kind != 'M' or np.isnat(data.timestamps).any():
@@ -102,17 +134,53 @@ class TrafficCleaner:
         if len(np.unique(data.sampleId)) != sampleCount:
             raise ValueError('Sample IDs must be unique within each split')
 
-        validMask = data.validMask.copy()
-        validMask = validMask & np.isfinite(x).all(axis = 1)
-
         if y is not None:
+            if not isinstance(y, np.ndarray):
+                raise ValueError('y must be a NumPy array')
             if y.ndim != DIMENSION_NUM_3 or y.shape[0] != sampleCount:
                 raise ValueError('y has the wrong sample dimension')
             if y.shape[1] <= 0 or y.shape[2] != sensorCount:
                 raise ValueError('y has the wrong horizon or sensor dimension')
-            validMask = validMask & np.isfinite(y).all(axis=1)
+            if y.dtype.kind not in 'fiu':
+                raise ValueError('y must contain real numeric values')
 
+    def clean(self, data: TrafficData) -> TrafficData:
+
+        x = data.x
+        y = data.y
+
+        validX = np.isfinite(x)
+        validX[x < 0] = False
+
+        if self.maxSpeed is not None:
+            validX[x > self.maxSpeed] = False
+
+        validHistory = validX.all(axis = 1)
+
+        validMask = data.validMask.copy()
+		
+        validMask[validHistory == False] = False
+
+        if y is not None:
+            validY = np.isfinite(y)
+            validY[y < 0] = False
+
+            if self.maxSpeed is not None:
+                validY[y > self.maxSpeed] = False
+
+                validFuture = validY.all(axis = 1)
+                validMask[validFuture == False] = False
+
+        if not validMask.any():
+            raise ValueError('No valid sample-sensor pairs remain after cleaning')
+
+        data.x = np.where(validMask[:, None, :], x, 0)
+        if y is not None:
+            data.y = np.where(validMask[:, None, :], y, 0)
+		
         data.validMask = validMask
+        data.normalizedX = None
+        data.normalizedY = None
 
         return data
 
@@ -134,13 +202,16 @@ class TrafficZScoreNormalizer:
         for sensorIndex in range(sensorCount):
             validRows = data.validMask[:, sensorIndex]
             values = data.x[validRows, :, sensorIndex]
+
             if values.size == 0 or not np.isfinite(values).all():
                 raise ValueError('No complete training data for sensor ' + str(sensorIndex))
+            
             mean[sensorIndex] = np.mean(values, dtype = np.float64)
             std[sensorIndex] = np.std(values, dtype = np.float64)
 
             if std[sensorIndex] < 0.00000001:
                 std[sensorIndex] = 1.0
+        
         self.mean = mean
         self.std = std
         self.sensorIds = data.sensorIds.copy()
@@ -149,14 +220,17 @@ class TrafficZScoreNormalizer:
 
         if self.mean is None or self.std is None:
             raise ValueError('Normalize training data first')
+        
         if not np.array_equal(data.sensorIds, self.sensorIds):
             raise ValueError('Sensor IDs or order differ from training data')
 
         sensorCount = data.x.shape[2]
         if self.mean.shape != (sensorCount,) or self.std.shape != (sensorCount,):
             raise ValueError('mean and std must have one value per sensor')
+        
         if not np.isfinite(self.mean).all() or not np.isfinite(self.std).all():
             raise ValueError('mean and std must contain finite values')
+        
         if np.any(self.std <= 0):
             raise ValueError('std must contain positive values')
 
@@ -212,9 +286,12 @@ class TrafficDataPreparer:
         history = None
         horizon = None
         sensorIds = None
+
         for split in ['train', 'validation', 'test_features']:
             raw = self.loader.load(split)
+            self.cleaner.validate(raw)
             clean = self.cleaner.clean(raw)
+
             if split == 'train':
                 if clean.y is None:
                     raise ValueError('Training targets are required')
@@ -255,6 +332,7 @@ class TrafficDataPreparer:
 
         outputDir = Path(outputDir)
         outputDir.mkdir(parents = True, exist_ok = True)
+
         for split in ['train', 'validation', 'test_features']:
             data = splits[split]
             arrays = {
@@ -278,6 +356,7 @@ class TrafficDataPreparer:
         sensor_ids = normalizer.sensorIds,
         method = np.array('zscore'),
     )
+
 
 class TrafficWindowDataset:
 
@@ -339,9 +418,6 @@ class TrafficWindowDataset:
         }
 
 
-
-
-
 def main():
     dataDir = 'data'
     outputDir = 'processed'
@@ -349,7 +425,7 @@ def main():
     logger.info("Data preparation started")
 
     loader = TrafficNpzLoader(dataDir)
-    cleaner = TrafficCleaner()
+    cleaner = TrafficCleaner(MAX_SPEED_CHECK)
     normalizer = TrafficZScoreNormalizer()
     featureBuilder = TrafficTimeFeatureBuilder()
 
